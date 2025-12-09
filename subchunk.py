@@ -238,8 +238,9 @@ class Simplex:
         """Find the set of possible entering variables, with their goal derivative. """
         return {var: coef for var, coef in self._eqs["goal"].var_terms.items() if coef > 0}
 
-    def possible_leaving(self, enter_var: str) -> set[str]:
-        """Find the set of possible leaving variables for a given entering variable."""
+    def possible_leaving(self, enter_var: str) -> tuple[set[str], Fraction]:
+        """Find the set of possible leaving variables for a given entering variable, and how much
+           they allow the entering variable to increase."""
         ret: set[str] = set()
         min_inc = Fraction()
         for var, expr in self._eqs.items():
@@ -251,7 +252,7 @@ class Simplex:
                         min_inc = inc
                     elif inc == min_inc:
                         ret.add(var)
-        return ret
+        return ret, min_inc
 
     def __str__(self) -> str:
         ret = "Simplex:\n"
@@ -265,7 +266,8 @@ ONE = Fraction(1)
 def linearize_subchunk_simplex(depgraph: DepGraph,
                                enforce_level: int=1,
                                avoid_level: int=0,
-                               max_deriv: bool=False) -> tuple[list[int], int, int]:
+                               max_deriv: bool=False,
+                               prefer_reflect: bool=False) -> tuple[list[int], int, int]:
     """The most naive simplex-based subchunk linearizer.
 
     @param depgraph: the DepGraph to linearize
@@ -276,6 +278,8 @@ def linearize_subchunk_simplex(depgraph: DepGraph,
     @param avoid_level: To what extent dependency violations should be prevented by not considering
                         them as entering variables (0, 1, 2, with the same meaning as above).
     @param max_deriv: Whether entering variable selection should be done using max derivative.
+    @param prefer_reflect: Whenever a w_{x,y,z} or v_{x,y} variable is made free, and the goal
+                           is increased, make the reflected variable (w_{z,y,z} or v_{y,x}) basic.
     """
     init_lin = list(depgraph.positions())
     random.shuffle(init_lin)
@@ -290,6 +294,7 @@ def linearize_subchunk_simplex(depgraph: DepGraph,
     free_vars: set[str] = set()
     forced_free_vars: set[str] = set()
     steps = 0
+    reflect_map: dict[str, str] = {}
     for p1 in depgraph.positions():
         fr1 = depgraph.feerate(p1)
         for p2 in depgraph.positions():
@@ -298,6 +303,7 @@ def linearize_subchunk_simplex(depgraph: DepGraph,
                 simplex.add_equation(LinearExpr([(f"v_{p1}_{p2}", ONE), (f"v_{p2}_{p1}", ONE)]),
                                      LinearExpr(const=ONE))
             if p1 != p2:
+                reflect_map[f"v_{p1}_{p2}"] = f"v_{p2}_{p1}"
                 fr2 = depgraph.feerate(p2)
                 # Add term to goal: v_{x,y} * fee(x) * size(y).
                 goal_expr += LinearExpr([(f"v_{p1}_{p2}", Fraction(fr1.fee * fr2.size))])
@@ -325,6 +331,8 @@ def linearize_subchunk_simplex(depgraph: DepGraph,
                 simplex.add_equation(LinearExpr([(f"w_{p1}_{p2}_{p3}", ONE),
                                                  (f"w_{p3}_{p2}_{p1}", ONE)]),
                                      LinearExpr(const=ONE))
+                reflect_map[f"w_{p1}_{p2}_{p3}"] = f"w_{p3}_{p2}_{p1}"
+                reflect_map[f"w_{p3}_{p2}_{p1}"] = f"w_{p1}_{p2}_{p3}"
     # Add goal equation.
     assert simplex.add_equation(LinearExpr(var="goal"), goal_expr)
     if enforce_level == 1:
@@ -349,20 +357,28 @@ def linearize_subchunk_simplex(depgraph: DepGraph,
             enter_cand.pop(var, None)
         if not enter_cand:
             break
-        if max_deriv:
-            max_coef = max(enter_cand.values())
-            enter_cand = {var: coef for var, coef in enter_cand.items() if coef == max_coef}
-        enter_var = random.choice(list(enter_cand.keys()))
-        leave_cand = simplex.possible_leaving(enter_var)
+        while True:
+            enter_var = random.choice(list(enter_cand.keys()))
+            leave_cand, enter_inc = simplex.possible_leaving(enter_var)
+            if max_deriv and enter_cand[enter_var] != max(enter_cand.values()):
+                continue
+            if enter_inc != 0 and enter_inc != 1:
+                del enter_cand[enter_var]
+                continue
+            if enter_inc > 0:
+                assert reflect_map[enter_var] in leave_cand
+            break
         leave_var = random.choice(list(leave_cand))
+        if prefer_reflect and reflect_map[enter_var] in leave_cand:
+            leave_var = reflect_map[enter_var]
         simplex.make_step(enter_var, leave_var)
         steps += 1
     sol = simplex.get_basic_solution()
     init_lin.sort(key=cmp_to_key(lambda a,b: 0 if a==b else 1-2*int(sol[f"v_{a}_{b}"])))
     return init_lin, steps, int(sol["goal"])
 
-class TestSFL(unittest.TestCase):
-    """Unit tests for the SFL algorithm."""
+class TestSubchunk(unittest.TestCase):
+    """Unit tests for the subchunk linearization algorithm."""
 
     def test_optimal(self) -> None:
         """Compare linearizations with known-optimal chunk feerate diagrams."""
@@ -374,12 +390,13 @@ class TestSFL(unittest.TestCase):
                 ser = bytes.fromhex(ser_hex)
                 dg = DepGraphFormatter().deserialize(ser)
                 assert dg is not None
-                if dg.tx_count() > 12:
+                if dg.tx_count() > 16:
                     continue
                 if dg.dep_count() <= dg.tx_count() + 1:
                     continue
                 expected_diagram.sort()
-                for config in ((0, 2, False), (0, 1, False), (0, 2, True), (0, 1, True)):
+                print()
+                for config in ((0, 1, False, False), (0, 1, False, True), (0, 1, True, False), (0, 1, True, True), (0, 2, False, False), (0, 2, False, True), (0, 2, True, False), (0, 2, True, True)):
                     expect_area: int | None = None
                     steps_n = 0
                     steps_s = 0
@@ -388,7 +405,8 @@ class TestSFL(unittest.TestCase):
                         lin, steps, area = linearize_subchunk_simplex(depgraph=dg,
                                                                       enforce_level=config[0],
                                                                       avoid_level=config[1],
-                                                                      max_deriv=config[2])
+                                                                      max_deriv=config[2],
+                                                                      prefer_reflect=config[3])
                         assert is_topological(dg, lin)
                         if expect_area is None:
                             chunking = compute_chunking(dg, lin)
@@ -404,7 +422,7 @@ class TestSFL(unittest.TestCase):
                     avg = steps_s / steps_n
                     stddev = math.sqrt((steps_q - steps_s**2 / steps_n) / (steps_n - 1))
                     print(f"ntx={dg.tx_count()} ndeps={dg.dep_count()} "
-                          f"enforce={config[0]} avoid={config[1]} max_deriv={config[2]}: "
+                          f"enforce={config[0]} avoid={config[1]} max_deriv={config[2]} reflect={config[3]}: "
                           f"steps={avg:.2f}+-{stddev:.2f} area={expected_area}")
 
 if __name__ == '__main__':
