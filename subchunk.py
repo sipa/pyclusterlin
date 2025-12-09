@@ -4,11 +4,12 @@ from __future__ import annotations
 from fractions import Fraction
 from pathlib import Path
 from functools import cmp_to_key
+import math
 import unittest
 import json
 from dataclasses import dataclass
 import random
-from depgraph import DepGraph, is_topological, DepGraphFormatter, FeeFrac, compute_chunking
+from depgraph import DepGraph, is_topological, DepGraphFormatter, compute_chunking
 
 @dataclass(slots=True)
 class LinearExpr:
@@ -217,11 +218,9 @@ class Simplex:
     def make_free(self, free_vars: set[str]) -> None:
         """Make the provided set of variables free."""
         assert len(free_vars) == len(self._free_vars)
-#        print(f"Making free: {free_vars}")
         while not free_vars.isdisjoint(self._eqs.keys()):
             good = False
             for leave_var in free_vars & self._eqs.keys():
-#                print(f"Attempting leave_var={leave_var} expr_vars={self._eqs[leave_var].get_variables()} enter_cand={self._eqs[leave_var].get_variables() & free_vars}")
                 if not (enter_candidates := self._eqs[leave_var].get_variables() - free_vars):
                     continue
                 enter_var = random.choice(list(enter_candidates))
@@ -254,11 +253,6 @@ class Simplex:
                         ret.add(var)
         return ret
 
-    def sanity_check(self) -> None:
-        assert self._eqs.keys().isdisjoint(self._free_vars)
-        for expr in self._eqs.values():
-            assert set(expr.var_terms.keys()).issubset(self._free_vars)
-
     def __str__(self) -> str:
         ret = "Simplex:\n"
         ret += "* Free: " + ", ".join(sorted(self._free_vars)) + "\n"
@@ -268,8 +262,21 @@ class Simplex:
 
 ONE = Fraction(1)
 
-def linearize_subchunk_simplex(depgraph: DepGraph) -> list[int]:
-    """The most naive simplex-based subchunk linearizer."""
+def linearize_subchunk_simplex(depgraph: DepGraph,
+                               enforce_level: int=1,
+                               avoid_level: int=0,
+                               max_deriv: bool=False) -> tuple[list[int], int, int]:
+    """The most naive simplex-based subchunk linearizer.
+
+    @param depgraph: the DepGraph to linearize
+    @param enforce_level: To what extent dependency violations should be prevented using equations:
+                          * 0: not at all
+                          * 1: only direct dependencies
+                          * 2: direct and indirect dependencies
+    @param avoid_level: To what extent dependency violations should be prevented by not considering
+                        them as entering variables (0, 1, 2, with the same meaning as above).
+    @param max_deriv: Whether entering variable selection should be done using max derivative.
+    """
     init_lin = list(depgraph.positions())
     random.shuffle(init_lin)
     init_lin.sort(key=lambda pos: len(depgraph.ancestors(pos)))
@@ -281,16 +288,26 @@ def linearize_subchunk_simplex(depgraph: DepGraph) -> list[int]:
     simplex = Simplex()
     goal_expr = LinearExpr()
     free_vars: set[str] = set()
+    forced_free_vars: set[str] = set()
+    steps = 0
     for p1 in depgraph.positions():
         fr1 = depgraph.feerate(p1)
         for p2 in depgraph.positions():
             if p1 < p2:
-                assert simplex.add_equation(LinearExpr([(f"v_{p1}_{p2}", ONE), (f"v_{p2}_{p1}", ONE)]), LinearExpr(const=ONE))
+                # Add equation: v_{x,y} + v_{y,x} = 1.
+                simplex.add_equation(LinearExpr([(f"v_{p1}_{p2}", ONE), (f"v_{p2}_{p1}", ONE)]),
+                                     LinearExpr(const=ONE))
             if p1 != p2:
                 fr2 = depgraph.feerate(p2)
+                # Add term to goal: v_{x,y} * fee(x) * size(y).
                 goal_expr += LinearExpr([(f"v_{p1}_{p2}", Fraction(fr1.fee * fr2.size))])
                 if init_posmap[p1] > init_posmap[p2]:
+                    # Make v_{x,y} free if y appears before x in init_lin.
                     free_vars.add(f"v_{p1}_{p2}")
+                    if avoid_level == 1 and p1 in depgraph.reduced_children(p2):
+                        forced_free_vars.add(f"v_{p1}_{p2}")
+                    elif avoid_level == 2 and p1 in depgraph.descendants(p2):
+                        forced_free_vars.add(f"v_{p1}_{p2}")
     for p1 in depgraph.positions():
         for p2 in depgraph.positions():
             if p2 <= p1:
@@ -298,25 +315,51 @@ def linearize_subchunk_simplex(depgraph: DepGraph) -> list[int]:
             for p3 in depgraph.positions():
                 if p3 <= p2:
                     continue
-                assert(p1 < p2)
-                assert(p1 < p3)
-                assert(p2 < p3)
-                assert simplex.add_equation(LinearExpr(var=f"w_{p1}_{p2}_{p3}"), LinearExpr([(f"v_{p1}_{p2}", ONE), (f"v_{p2}_{p3}", ONE), (f"v_{p3}_{p1}", ONE)], const=-ONE))
-                assert simplex.add_equation(LinearExpr([(f"w_{p1}_{p2}_{p3}", ONE), (f"w_{p3}_{p2}_{p1}", ONE)]), LinearExpr(const=ONE))
+                # Add equation: w_{x,y,z} = v_{x,y} + v_{y,z} + v_{z,x} - 1.
+                simplex.add_equation(LinearExpr(var=f"w_{p1}_{p2}_{p3}"),
+                                     LinearExpr([(f"v_{p1}_{p2}", ONE),
+                                                 (f"v_{p2}_{p3}", ONE),
+                                                 (f"v_{p3}_{p1}", ONE)],
+                                                const=-ONE))
+                # Add equation w_{x,y,z} + w_{z,y,x} = 1.
+                simplex.add_equation(LinearExpr([(f"w_{p1}_{p2}_{p3}", ONE),
+                                                 (f"w_{p3}_{p2}_{p1}", ONE)]),
+                                     LinearExpr(const=ONE))
+    # Add goal equation.
     assert simplex.add_equation(LinearExpr(var="goal"), goal_expr)
-    for p1 in depgraph.positions():
-        for p2 in depgraph.reduced_children(p1):
-            assert simplex.add_equation(LinearExpr(var=f"v_{p2}_{p1}"))
-            free_vars.remove(f"v_{p2}_{p1}")
+    if enforce_level == 1:
+        for p1 in depgraph.positions():
+            for p2 in depgraph.reduced_children(p1):
+                # Add equation: v_{x,y} = 0.
+                simplex.add_equation(LinearExpr(var=f"v_{p2}_{p1}"))
+                free_vars.remove(f"v_{p2}_{p1}")
+                forced_free_vars.discard(f"v_{p2}_{p1}")
+    elif enforce_level == 2:
+        for p1 in depgraph.positions():
+            for p2 in depgraph.descendants(p1):
+                if p1 != p2:
+                    # Add equation: v_{x,y} = 0.
+                    simplex.add_equation(LinearExpr(var=f"v_{p2}_{p1}"))
+                    free_vars.remove(f"v_{p2}_{p1}")
+                    forced_free_vars.discard(f"v_{p2}_{p1}")
+
     simplex.make_free(free_vars)
     while (enter_cand := simplex.possible_entering()):
+        for var in forced_free_vars:
+            enter_cand.pop(var, None)
+        if not enter_cand:
+            break
+        if max_deriv:
+            max_coef = max(enter_cand.values())
+            enter_cand = {var: coef for var, coef in enter_cand.items() if coef == max_coef}
         enter_var = random.choice(list(enter_cand.keys()))
         leave_cand = simplex.possible_leaving(enter_var)
         leave_var = random.choice(list(leave_cand))
         simplex.make_step(enter_var, leave_var)
+        steps += 1
     sol = simplex.get_basic_solution()
     init_lin.sort(key=cmp_to_key(lambda a,b: 0 if a==b else 1-2*int(sol[f"v_{a}_{b}"])))
-    return init_lin
+    return init_lin, steps, int(sol["goal"])
 
 class TestSFL(unittest.TestCase):
     """Unit tests for the SFL algorithm."""
@@ -331,17 +374,38 @@ class TestSFL(unittest.TestCase):
                 ser = bytes.fromhex(ser_hex)
                 dg = DepGraphFormatter().deserialize(ser)
                 assert dg is not None
-                if dg.tx_count() > 16:
+                if dg.tx_count() > 12:
                     continue
-                print(dg.tx_count())
+                if dg.dep_count() <= dg.tx_count() + 1:
+                    continue
                 expected_diagram.sort()
-                for _ in range(10):
-                    lin = linearize_subchunk_simplex(dg)
-                    assert is_topological(dg, lin)
-                    chunking = compute_chunking(dg, lin)
-                    diagram = [[si.feerate.fee, si.feerate.size] for si in chunking]
-                    diagram.sort()
-                    self.assertEqual(diagram, expected_diagram)
+                for config in ((0, 2, False), (0, 1, False), (0, 2, True), (0, 1, True)):
+                    expect_area: int | None = None
+                    steps_n = 0
+                    steps_s = 0
+                    steps_q = 0
+                    for _ in range(100):
+                        lin, steps, area = linearize_subchunk_simplex(depgraph=dg,
+                                                                      enforce_level=config[0],
+                                                                      avoid_level=config[1],
+                                                                      max_deriv=config[2])
+                        assert is_topological(dg, lin)
+                        if expect_area is None:
+                            chunking = compute_chunking(dg, lin)
+                            diagram = [[si.feerate.fee, si.feerate.size] for si in chunking]
+                            diagram.sort()
+                            self.assertEqual(diagram, expected_diagram)
+                            expected_area = area
+                        else:
+                            assert expected_area == area
+                        steps_n += 1
+                        steps_s += steps
+                        steps_q += steps * steps
+                    avg = steps_s / steps_n
+                    stddev = math.sqrt((steps_q - steps_s**2 / steps_n) / (steps_n - 1))
+                    print(f"ntx={dg.tx_count()} ndeps={dg.dep_count()} "
+                          f"enforce={config[0]} avoid={config[1]} max_deriv={config[2]}: "
+                          f"steps={avg:.2f}+-{stddev:.2f} area={expected_area}")
 
 if __name__ == '__main__':
     unittest.main()

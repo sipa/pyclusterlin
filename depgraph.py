@@ -135,6 +135,10 @@ class DepGraph:
         """Get the number of transactions in the graph."""
         return len(self._used)
 
+    def dep_count(self) -> int:
+        """Get the number of dependencies in the graph."""
+        return sum(len(self.reduced_parents(i)) for i in self.positions())
+
     def position_range(self) -> int:
         """Get the highest used position in the graph plus 1."""
         return len(self._feefracs)
