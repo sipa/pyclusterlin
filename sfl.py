@@ -37,37 +37,20 @@ class SpanningForestState:
         for tx in depgraph.positions():
             self._txchunk[tx] = SetInfo.make_singleton(depgraph, tx)
 
-    def _walk(self, start: int, chunk: SetInfo, dep_adjust: SetInfo, subtract: bool) -> None:
-        """Walk all transactions of a chunk, update the chunk representatives and dependency
-           info."""
-        # The set of transactions that are known to need visiting still.
-        todo = {start}
-        # The set of transactions that have been visited already.
-        done: set[int] = set()
-        while todo != done:
-            for tx_idx in todo - done:
-                # Visit the transaction and mark it as processed.
-                self._txchunk[tx_idx] = chunk
-                done.add(tx_idx)
-                # Iterate over all its parents.
-                for par in self._parents[tx_idx]:
-                    if par in done or (par, tx_idx) not in self._active_deps:
-                        continue
-                    # If the dependency to this parent is active, and it has not been visited
-                    # already, we need to process it.
-                    todo.add(par)
-                # Iterate over all its children.
-                for chl in self._children[tx_idx]:
-                    info = self._active_deps.get((tx_idx, chl))
-                    if info is None or chl in done:
-                        continue
-                    # If the dependency to this child is active, and it has not been visited
-                    # already, we need to adjust the dependency, and process the child.
-                    if subtract:
-                        info -= dep_adjust
-                    else:
-                        info += dep_adjust
-                    todo.add(chl)
+    def _update_deps(self, txn: set[int], query: int, dep_adjust: SetInfo, subtract: bool) -> None:
+        """Update all dependencies between transactions in txn that have query in their top set,
+           adding/removing dep_adjust from the top set."""
+        for (par, chl), dep in self._active_deps.items():
+            if query in dep.transactions and par in txn and chl in txn:
+                if subtract:
+                    dep -= dep_adjust
+                else:
+                    dep += dep_adjust
+
+    def _update_chunk(self, chunk: SetInfo) -> None:
+        """Update all transactions in chunk to have chunk as their chunk."""
+        for tx in chunk.transactions:
+            self._txchunk[tx] = chunk
 
     def _activate(self, par: int, chl: int) -> SetInfo:
         """Activate the dependency chl->par, and return the new chunk."""
@@ -78,11 +61,12 @@ class SpanningForestState:
         bottom_chunk = self._txchunk[chl]
         assert top_chunk.transactions.isdisjoint(bottom_chunk.transactions)
         # We will reuse the bottom chunk for the new combined chunk.
-        self._walk(par, bottom_chunk, bottom_chunk, False)
-        self._walk(chl, bottom_chunk, top_chunk, False)
+        self._update_deps(top_chunk.transactions, par, bottom_chunk, False)
+        self._update_deps(bottom_chunk.transactions, chl, top_chunk, False)
         # Mark the dependency active, and merge the top chunk into the bottom chunk.
         self._active_deps[(par, chl)] = top_chunk
         bottom_chunk += top_chunk
+        self._update_chunk(bottom_chunk)
         return bottom_chunk
 
     def _deactivate(self, par: int, chl: int) -> tuple[SetInfo, SetInfo]:
@@ -95,8 +79,10 @@ class SpanningForestState:
         bottom_chunk = self._txchunk[par]
         bottom_chunk -= top_chunk
         # Update the transactions and dependencies.
-        self._walk(par, top_chunk, bottom_chunk, True)
-        self._walk(chl, bottom_chunk, top_chunk, True)
+        self._update_deps(top_chunk.transactions, par, bottom_chunk, True)
+        self._update_deps(bottom_chunk.transactions, chl, top_chunk, True)
+        self._update_chunk(top_chunk)
+        self._update_chunk(bottom_chunk)
         return top_chunk, bottom_chunk
 
     def _merge_chunks(self, top_chunk: SetInfo, bottom_chunk: SetInfo) -> SetInfo | None:
