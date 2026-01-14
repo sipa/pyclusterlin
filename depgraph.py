@@ -69,29 +69,51 @@ class FeeFrac:
         """Convert this FeeFrac to a string."""
         return f"{self.fee}/{self.size}"
 
-
 @total_ordering
-class _FeeFracByFeeRate:
+class FeeFracByFeeRate:
     """A helper class to compare FeeFrac objects only by feerate."""
     __slots__ = ("_feerate",)
 
     def __init__(self, feerate: FeeFrac) -> None:
         self._feerate = feerate
 
-    def __lt__(self, other: _FeeFracByFeeRate) -> bool:
+    def __lt__(self, other: FeeFracByFeeRate) -> bool:
         return self._feerate.compare_feerate(other._feerate) < 0
 
     def __eq__(self, other: object) -> bool:
-        if not isinstance(other, _FeeFracByFeeRate):
+        if not isinstance(other, FeeFracByFeeRate):
             raise NotImplementedError
         return self._feerate.compare_feerate(other._feerate) == 0
 
     def __hash__(self) -> int:
         raise NotImplementedError
 
-def by_feerate(feerate: FeeFrac) -> _FeeFracByFeeRate:
+def by_feerate(feerate: FeeFrac) -> FeeFracByFeeRate:
     """Helper to compare FeeFrac objects only by feerate."""
-    return _FeeFracByFeeRate(feerate)
+    return FeeFracByFeeRate(feerate)
+
+@total_ordering
+class FeeFracByGoodness:
+    """A helper class to compare FeeFrac objects by decreasing goodness."""
+    __slots__ = ("_feerate",)
+
+    def __init__(self, feerate: FeeFrac) -> None:
+        self._feerate = feerate
+
+    def __lt__(self, other: FeeFracByFeeRate) -> bool:
+        return self._feerate.compare_total(other._feerate) > 0
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, FeeFracByGoodness):
+            raise NotImplementedError
+        return self._feerate == other._feerate
+
+    def __hash__(self) -> int:
+        raise NotImplementedError
+
+def by_goodness(feerate: FeeFrac) -> FeeFracByGoodness:
+    """Helper to compare FeeFrac objects by decreasing goodness."""
+    return FeeFracByGoodness(feerate)
 
 class DepGraph:
     """A class representing a dependency graph of transactions."""

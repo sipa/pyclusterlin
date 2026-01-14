@@ -8,13 +8,17 @@ import json
 import random
 import heapq
 import unittest
+from collections.abc import Callable
 from pathlib import Path
-from depgraph import FeeFrac, SetInfo, DepGraph, DepGraphFormatter, compute_chunking, is_topological
+from typing import Any
+from depgraph import (SetInfo, DepGraph, DepGraphFormatter, is_topological, by_goodness,
+                      FeeFracByGoodness)
 
 class SpanningForestState:
     """Data structure representing the state of the SFL algorithm."""
 
-    __slots__ = ("_rng", "_parents", "_children", "_txchunk", "_active_deps", "_transactions")
+    __slots__ = ("_rng", "_parents", "_children", "_txchunk", "_active_deps", "_transactions",
+                 "_depgraph")
 
     def __init__(self, depgraph: DepGraph, rng_seed: int) -> None:
         """Construct an SFL state object, with every transaction in its own singleton chunk."""
@@ -33,6 +37,8 @@ class SpanningForestState:
         # Information about all its active dependencies (initially, none). It stores the SetInfo
         # of the would-be top chunk that would be created by deactivating said dependency.
         self._active_deps: dict[tuple[int, int], SetInfo] = {}
+        # Store the depgraph this is for.
+        self._depgraph = depgraph
         # Create a chunk for every transaction.
         for tx in depgraph.positions():
             self._txchunk[tx] = SetInfo.make_singleton(depgraph, tx)
@@ -266,10 +272,11 @@ class SpanningForestState:
                     for tx in chunk.transactions:
                         txinfo[tx] = (pivot, True)
 
-    def get_linearization(self) -> list[int]:
+    def get_linearization(self, fallback_key: Callable[[int], int]=lambda x: x) -> list[int]:
         """Produce a linearization. Requires that the SFL state is topological."""
-        # A heap of chunks which have no unmet dependencies, as (-feerate, chunk_rep) pairs.
-        ready_chunks: list[tuple[FeeFrac, int]] = []
+        # A heap of chunks which have no unmet dependencies, as (feerate, max_fallback, chunk_rep)
+        # tuples.
+        ready_chunks: list[tuple[FeeFracByGoodness, int, int]] = []
         # A dict of first_tx_in_chunk -> unmet dependencies.
         chunk_deps: dict[int, int] = {}
         ret: list[int] = []
@@ -289,14 +296,17 @@ class SpanningForestState:
             rep = next(iter(chunk.transactions))
             chunk_deps[rep] = deps
             if deps == 0:
-                heapq.heappush(ready_chunks, (-chunk.feerate, rep))
+                max_fallback = max(fallback_key(tx) for tx in chunk.transactions)
+                heapq.heappush(ready_chunks, (by_goodness(chunk.feerate),
+                                              max_fallback, rep))
         # Loop over the ready chunks, producing an output linearization for each.
         while ready_chunks:
             # Pop the highest-feerate chunk off the heap.
-            _, chunk_rep = heapq.heappop(ready_chunks)
+            _chunk_feerate, _max_fallback_key, chunk_rep = heapq.heappop(ready_chunks)
             chunk = self._txchunk[chunk_rep]
-            # A list of transactions which have no unmet dependencies.
-            ready_tx: list[int] = []
+            # A heap of transactions which have no unmet dependencies, as (feerate, fallback, idx)
+            # tuples.
+            ready_tx: list[tuple[FeeFracByGoodness, int, int]] = []
             # A dict of tx -> unmet dependencies.
             tx_deps: dict[int, int] = {}
             # Compute for each transaction how many unmet dependencies it has, and add those with
@@ -304,12 +314,13 @@ class SpanningForestState:
             for tx in chunk.transactions:
                 tx_deps[tx] = len(self._parents[tx] & chunk.transactions)
                 if tx_deps[tx] == 0:
-                    ready_tx.append(tx)
+                    heapq.heappush(ready_tx, (by_goodness(self._depgraph.feerate(tx)),
+                                              fallback_key(tx), tx))
             # Loop over the ready transactions, adding each to the output linearization and
             # reducing the relevant unmet dependency counts for its children.
             while ready_tx:
                 # Pop a transactions off the list.
-                tx = ready_tx.pop()
+                _tx_feerate, _fallback_key, tx = heapq.heappop(ready_tx)
                 # Add it to the output linearization.
                 ret.append(tx)
                 # Loop over its children, whose unmet dependency counts need to be reduced.
@@ -320,7 +331,8 @@ class SpanningForestState:
                         tx_deps[chl] -= 1
                         if tx_deps[chl] == 0:
                             # The child has no unmet dependencies left, add it to the ready list.
-                            ready_tx.append(chl)
+                            heapq.heappush(ready_tx, (by_goodness(self._depgraph.feerate(chl)),
+                                                      fallback_key(chl), chl))
                     else:
                         # The child is in another chunk, reduce the per-chunk out-of-chunk unmet
                         # dependency count for that chunk.
@@ -330,13 +342,15 @@ class SpanningForestState:
                         if chunk_deps[chl_chunk_rep] == 0:
                             # The child chunk has no out-of-chunk unmet dependencies left, add it
                             # to the ready heap.
-                            heapq.heappush(ready_chunks, (-chl_chunk.feerate, chl_chunk_rep))
+                            max_fallback = max(fallback_key(tx) for tx in chl_chunk.transactions)
+                            heapq.heappush(ready_chunks, (by_goodness(chl_chunk.feerate),
+                                                          max_fallback, chl_chunk_rep))
         return ret
 
 def linearize(depgraph: DepGraph,
               input_linearization: list[int] | None=None,
               fix_linearization: list[int] | None=None,
-              minimize: bool=True) -> list[int]:
+              minimize: bool=True, fallback_key: Callable[[int], Any]=lambda x: x) -> list[int]:
     """Produce an optimal linearization for the given graph."""
     sfl = SpanningForestState(depgraph, random.getrandbits(64))
     # Construct a topological SFL state from the input.
@@ -358,7 +372,7 @@ def linearize(depgraph: DepGraph,
     if minimize:
         sfl.minimize()
     # Produce an output linearization.
-    return sfl.get_linearization()
+    return sfl.get_linearization(fallback_key)
 
 class TestSFL(unittest.TestCase):
     """Unit tests for the SFL algorithm."""
@@ -368,19 +382,17 @@ class TestSFL(unittest.TestCase):
 
         data_file = Path(__file__).resolve().parent / 'linearization_tests.json'
         with open(data_file, "r", encoding='utf-8') as input_file:
-            data = json.load(fp=input_file)['optimal_linearization_chunkings']
-            for ser_hex, expected_diagram in data:
+            data = json.load(fp=input_file)['optimal_linearizations']
+            for ser_hex, expected_linearization in data:
                 ser = bytes.fromhex(ser_hex)
                 dg = DepGraphFormatter().deserialize(ser)
                 assert dg is not None
-                expected_diagram.sort()
                 for _ in range(10):
                     lin = linearize(dg)
                     assert is_topological(dg, lin)
-                    chunking = compute_chunking(dg, lin)
-                    diagram = [[si.feerate.fee, si.feerate.size] for si in chunking]
-                    diagram.sort()
-                    self.assertEqual(diagram, expected_diagram)
+                    self.assertEqual(lin, expected_linearization)
+                linser = ', '.join(str(q) for q in lin)
+                print(f"    TestOptimalLinearization(\"{ser_hex}\"_hex_v_u8, {{{linser}}});")
 
 if __name__ == '__main__':
     unittest.main()
