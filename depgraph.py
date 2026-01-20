@@ -7,7 +7,7 @@
 from __future__ import annotations
 from dataclasses import dataclass
 from functools import total_ordering
-from typing import BinaryIO
+from typing import BinaryIO, Generator
 from serialization import Formatter, varint_formatter, signed_varint_formatter
 
 @dataclass(slots=True)
@@ -125,6 +125,15 @@ class DepGraph:
         self._feefracs: list[FeeFrac | None] = []
         self._ancestors: list[set[int]] = []
         self._descendants: list[set[int]] = []
+
+    def copy(self) -> DepGraph:
+        """Return a non-sharing copy of this DepGraph."""
+        ret = DepGraph()
+        ret._used = set(self._used)
+        ret._feefracs = list(self._feefracs)
+        ret._ancestors = [set(a) for a in self._ancestors]
+        ret._descendants = [set(d) for d in self._descendants]
+        return ret
 
     def add_transaction(self, feefrac: FeeFrac) -> int:
         """Add a transaction at the end of this graph, with no parents or children."""
@@ -293,14 +302,18 @@ class SetInfo:
         self.feerate -= other.feerate
         return self
 
-def compute_chunking(depgraph: DepGraph, linearization: list[int]) -> list[SetInfo]:
+def compute_chunking(depgraph: DepGraph, linearization: list[int], merge_equal: bool=False) -> list[SetInfo]:
     """Compute chunking for a given linearization, in [SetInfo] form."""
     ret: list[SetInfo] = []
     for pos in linearization:
         add = SetInfo.make_singleton(depgraph, pos)
-        while len(ret) > 0 and add.feerate.compare_feerate(ret[-1].feerate) > 0:
-            add += ret[-1]
-            ret.pop()
+        while len(ret) > 0:
+            if ((merge_equal and add.feerate.compare_feerate(ret[-1].feerate) >= 0) or
+                (not merge_equal and add.feerate.compare_feerate(ret[-1].feerate) > 0)):
+                add += ret[-1]
+                ret.pop()
+            else:
+                break
         ret.append(add)
     return ret
 
@@ -472,3 +485,26 @@ def is_topological(depgraph: DepGraph, lin: list[int]) -> bool:
     if done != depgraph.positions():
         return False
     return True
+
+def all_linearizations(depgraph: DepGraph) -> Generator[list[int], None, None]:
+    """Generate all topological linearizations of depgraph."""
+    num_tx = len(depgraph.positions())
+    ret: list[int] = []
+    todo = depgraph.positions()
+    pos = [[i for i in todo if len(depgraph.ancestors(i)) == 1]]
+    pos[-1].reverse()
+    while True:
+        while len(pos) > 1 and len(pos[-1]) == 0:
+            pos.pop()
+            todo.add(ret.pop())
+        if len(pos) == 1 and len(pos[0]) == 0:
+            break
+        choice = pos[-1].pop()
+        ret.append(choice)
+        if len(ret) == num_tx:
+            yield list(ret)
+            ret.pop()
+        else:
+            todo.remove(choice)
+            pos.append([i for i in todo if len(depgraph.ancestors(i) & todo) == 1])
+            pos[-1].reverse()
