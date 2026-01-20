@@ -107,35 +107,37 @@ class SpanningForestState:
         # Activate.
         return self._activate(par, chl)
 
+    def _get_reachable(self, start: set[int], downward: bool) -> set[int]:
+        """Get the set of transactions reachable from start in upward or downward direction."""
+        ret: set[int] = set()
+        for tx in start:
+            ret |= self._children[tx] if downward else self._parents[tx]
+        return ret - start
+
     def _merge_step(self, chunk: SetInfo, downward: bool) -> SetInfo | None:
         """Perform an upward or downward merge step, on the specified chunk. Returns the merged
            chunk, or None if no merge took place."""
-        # Locate chunk information
-        chunk_txn = chunk.transactions
-        explored = set(chunk_txn)
         # The candidate chunks to merge with.
         candidates: list[SetInfo] = []
         # The feerates to compare with. Initially, this is equal to the chunk's own feerate. It is
         # updated to be the feerate of candidates whenever any are found.
         candidate_feerate = chunk.feerate
         # Explore chunks that can be reached from chunk_txn, with appropriate feerate.
-        for tx in chunk_txn:
-            newly_reached = (self._children[tx] if downward else self._parents[tx]) - explored
-            explored |= newly_reached
-            while newly_reached:
-                new_chunk = self._txchunk[next(iter(newly_reached))]
-                newly_reached -= new_chunk.transactions
-                # Compare feerate of new chunk with existing candidate(s), if any.
-                comp = new_chunk.feerate.compare_feerate(candidate_feerate)
-                comp = comp if downward else -comp
-                # Ignore if this is worse than candidate_feerate.
-                if comp < 0:
-                    continue
-                # Replace candidates if this is strictly better than existing candidates.
-                if comp > 0:
-                    candidate_feerate = new_chunk.feerate
-                    candidates = []
-                candidates.append(new_chunk)
+        todo = self._get_reachable(chunk.transactions, downward)
+        while todo:
+            new_chunk = self._txchunk[next(iter(todo))]
+            todo -= new_chunk.transactions
+            # Compare feerate of new chunk with existing candidate(s), if any.
+            comp = new_chunk.feerate.compare_feerate(candidate_feerate)
+            comp = comp if downward else -comp
+            # Ignore if this is worse than candidate_feerate.
+            if comp < 0:
+                continue
+            # Replace candidates if this is strictly better than existing candidates.
+            if comp > 0:
+                candidate_feerate = new_chunk.feerate
+                candidates = []
+            candidates.append(new_chunk)
         # If no candidates exist, don't do anything.
         if not candidates:
             return None
