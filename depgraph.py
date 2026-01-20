@@ -5,9 +5,10 @@
 """Python reimplementation of the cluster mempool DepGraph code and its serialization."""
 
 from __future__ import annotations
+from collections.abc import Generator
 from dataclasses import dataclass
 from functools import total_ordering
-from typing import BinaryIO, Generator
+from typing import BinaryIO
 from serialization import Formatter, varint_formatter, signed_varint_formatter
 
 @dataclass(slots=True)
@@ -129,6 +130,7 @@ class DepGraph:
     def copy(self) -> DepGraph:
         """Return a non-sharing copy of this DepGraph."""
         ret = DepGraph()
+        # pylint: disable=protected-access
         ret._used = set(self._used)
         ret._feefracs = list(self._feefracs)
         ret._ancestors = [set(a) for a in self._ancestors]
@@ -168,7 +170,7 @@ class DepGraph:
 
     def dep_count(self) -> int:
         """Get the number of (reduced) dependencies in the graph."""
-        return sum(len(self.reduced_parents(tx)) for tx in self.positions)
+        return sum(len(self.reduced_parents(tx)) for tx in self.positions())
 
     def position_range(self) -> int:
         """Get the highest used position in the graph plus 1."""
@@ -306,7 +308,8 @@ class SetInfo:
         self.feerate -= other.feerate
         return self
 
-def compute_chunking(depgraph: DepGraph, linearization: list[int], merge_equal: bool=False) -> list[SetInfo]:
+def compute_chunking(depgraph: DepGraph, linearization: list[int],
+                     merge_equal: bool=False) -> list[SetInfo]:
     """Compute chunking for a given linearization, in [SetInfo] form."""
     ret: list[SetInfo] = []
     for pos in linearization:
@@ -490,7 +493,7 @@ def is_topological(depgraph: DepGraph, lin: list[int]) -> bool:
         return False
     return True
 
-def all_linearizations(depgraph: DepGraph) -> Generator[list[int], None, None]:
+def all_linearizations(depgraph: DepGraph) -> Generator[list[int]]:
     """Generate all topological linearizations of depgraph."""
     num_tx = len(depgraph.positions())
     ret: list[int] = []
