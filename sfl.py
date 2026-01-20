@@ -391,8 +391,6 @@ class TestSFL(unittest.TestCase):
                     lin = linearize(dg)
                     assert is_topological(dg, lin)
                     self.assertEqual(lin, expected_linearization)
-                linser = ', '.join(str(q) for q in lin)
-                print(f"    TestOptimalLinearization(\"{ser_hex}\"_hex_v_u8, {{{linser}}});")
 
 if __name__ == '__main__':
     unittest.main()
